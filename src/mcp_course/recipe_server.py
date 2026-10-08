@@ -95,14 +95,15 @@ def _parse_meal(meal: JSONDict) -> JSONDict:
             )
 
     tags: str | None = meal.get("strTags")
+    # TheMealDB sends explicit nulls, so use `or` rather than a .get() default
     return {
-        "name": meal.get("strMeal", "Unknown"),
-        "cuisine": meal.get("strArea", "Unknown"),
-        "category": meal.get("strCategory", "Unknown"),
-        "instructions": meal.get("strInstructions", "No instructions available"),
-        "image_url": meal.get("strMealThumb", ""),
-        "youtube_url": meal.get("strYoutube", ""),
-        "source_url": meal.get("strSource", ""),
+        "name": meal.get("strMeal") or "Unknown",
+        "cuisine": meal.get("strArea") or "Unknown",
+        "category": meal.get("strCategory") or "Unknown",
+        "instructions": meal.get("strInstructions") or "No instructions available",
+        "image_url": meal.get("strMealThumb") or "",
+        "youtube_url": meal.get("strYoutube") or "",
+        "source_url": meal.get("strSource") or "",
         "ingredients": ingredients,
         "tags": tags.split(",") if tags else [],
     }
