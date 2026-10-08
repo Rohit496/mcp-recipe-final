@@ -6,10 +6,11 @@ import tempfile
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, cast
 
 import requests
 from mcp.server.mcpserver import MCPServer
+from pydantic import Field
 
 type JSONDict = dict[str, Any]
 
@@ -21,10 +22,18 @@ RECIPES_DIR = SCRIPT_DIR / "recipes"
 
 MEALDB_BASE_URL = "https://www.themealdb.com/api/json/v1/1"
 INVALID_FILENAME_CHARS = '<>:"/\\|?*'
-NON_COLLECTION_DIRS = {"meal_plans", "by_letter"}
+# Folders that hold saved recipes but are not user-facing dish collections
+LOOKUP_DIRS = {"by_letter", "random"}
+NON_COLLECTION_DIRS = {"meal_plans", *LOOKUP_DIRS}
+RECIPES_FILE = "recipes_info.json"
 
 # Errors from local file I/O (OSError) and malformed JSON/API data
 DATA_ERRORS = (OSError, ValueError, KeyError, TypeError)
+
+# TheMealDB returns at most 25 meals per search
+type MaxResults = Annotated[
+    int, Field(ge=1, le=25, description="Number of results to return (1-25)")
+]
 
 
 # ==================== MCP SERVER SETUP ====================
@@ -71,12 +80,13 @@ def _sanitize_name(name: str, fallback: str) -> str:
     return safe
 
 
-def _fetch_meals(endpoint: str) -> list[JSONDict]:
+def _fetch_meals(endpoint: str, **params: str) -> list[JSONDict]:
     """Call a TheMealDB endpoint and return its `meals` list (empty if none)."""
-    response = requests.get(f"{MEALDB_BASE_URL}/{endpoint}", timeout=10)
+    response = requests.get(f"{MEALDB_BASE_URL}/{endpoint}", params=params, timeout=10)
     response.raise_for_status()
-    meals: list[JSONDict] | None = response.json().get("meals")
-    return meals or []
+    # "No results" arrives as null or as a string such as "no data found"
+    meals: object = response.json().get("meals")
+    return cast("list[JSONDict]", meals) if isinstance(meals, list) else []
 
 
 def _parse_meal(meal: JSONDict) -> JSONDict:
@@ -117,24 +127,50 @@ def _save_json(path: Path, data: object) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def _collection_dirs() -> list[Path]:
-    """Dish/cuisine folders that contain a saved recipes_info.json."""
+def _recipe_dirs() -> list[Path]:
+    """Every folder (collections and lookup folders) holding a saved recipes_info.json."""
     if not RECIPES_DIR.exists():
         return []
     return [
         d
         for d in RECIPES_DIR.iterdir()
-        if d.is_dir()
-        and d.name not in NON_COLLECTION_DIRS
-        and (d / "recipes_info.json").exists()
+        if d.is_dir() and d.name != "meal_plans" and (d / RECIPES_FILE).exists()
     ]
+
+
+def _collection_dirs() -> list[Path]:
+    """User-facing dish/cuisine collections."""
+    return [d for d in _recipe_dirs() if d.name not in NON_COLLECTION_DIRS]
+
+
+def _save_recipes(folder: Path, meals: list[JSONDict]) -> list[str]:
+    """Merge meals into folder/recipes_info.json so get_recipe_details can find them."""
+    folder.mkdir(mode=0o755, exist_ok=True)
+    file_path = folder / RECIPES_FILE
+
+    recipes_info: dict[str, JSONDict] = {}
+    if file_path.exists():
+        try:
+            recipes_info = _load_json(file_path)
+        except DATA_ERRORS as e:
+            logger.warning("Could not load existing file %s: %s", file_path, e)
+
+    recipe_ids: list[str] = []
+    for meal in meals:
+        recipe_id = str(meal["idMeal"])
+        recipe_ids.append(recipe_id)
+        recipes_info[recipe_id] = _parse_meal(meal)
+
+    _save_json(file_path, recipes_info)
+    logger.info("Results saved to: %s", file_path)
+    return recipe_ids
 
 
 # ==================== TOOLS ====================
 
 
 @mcp.tool()
-def search_recipes(dish_name: str, max_results: int = 5) -> list[str]:
+def search_recipes(dish_name: str, max_results: MaxResults = 5) -> list[str]:
     """
     Search for recipes by dish name. Extract ONLY the dish/food name from the user's query.
 
@@ -151,8 +187,12 @@ def search_recipes(dish_name: str, max_results: int = 5) -> list[str]:
     Returns:
         List of recipe IDs found in the search
     """
+    dish_name = dish_name.strip()
+    if not dish_name:
+        return ["Please provide a dish name"]
+
     try:
-        meals = _fetch_meals(f"search.php?s={dish_name}")[:max_results]
+        meals = _fetch_meals("search.php", s=dish_name)[:max_results]
     except requests.RequestException as e:
         return [f"Error fetching recipes: {e}"]
     except ValueError as e:
@@ -163,36 +203,9 @@ def search_recipes(dish_name: str, max_results: int = 5) -> list[str]:
 
     dish_path = RECIPES_DIR / _sanitize_name(dish_name, "unknown_dish")
     try:
-        dish_path.mkdir(mode=0o755, exist_ok=True)
-    except OSError as e:
-        return [f"Cannot create dish directory {dish_path}: {e}"]
-
-    file_path = dish_path / "recipes_info.json"
-
-    # Try to load existing recipes info
-    recipes_info: dict[str, JSONDict] = {}
-    if file_path.exists():
-        try:
-            recipes_info = _load_json(file_path)
-        except DATA_ERRORS as e:
-            logger.warning("Could not load existing file %s: %s", file_path, e)
-
-    recipe_ids: list[str] = []
-    try:
-        for meal in meals:
-            recipe_id: str = meal["idMeal"]
-            recipe_ids.append(recipe_id)
-            recipes_info[recipe_id] = _parse_meal(meal)
+        return _save_recipes(dish_path, meals)
     except DATA_ERRORS as e:
         return [f"Error in search_recipes: {e}"]
-
-    # Save updated recipes_info; return recipe IDs even if save fails
-    try:
-        _save_json(file_path, recipes_info)
-        logger.info("Results saved to: %s", file_path)
-    except OSError as e:
-        logger.warning("Could not save to file %s: %s", file_path, e)
-    return recipe_ids
 
 
 @mcp.tool()
@@ -214,9 +227,10 @@ def get_recipe_details(recipe_id: str) -> str:
     if not RECIPES_DIR.exists():
         return f"Recipes directory {RECIPES_DIR} does not exist."
 
+    recipe_id = recipe_id.strip()
     try:
-        for collection_dir in _collection_dirs():
-            file_path = collection_dir / "recipes_info.json"
+        for recipe_dir in _recipe_dirs():
+            file_path = recipe_dir / RECIPES_FILE
             try:
                 recipes_info: dict[str, JSONDict] = _load_json(file_path)
             except DATA_ERRORS as e:
@@ -248,13 +262,15 @@ def create_meal_plan(recipe_ids: list[str], plan_name: str = "My Meal Plan") -> 
     Returns:
         Success message with meal plan details or error message
     """
-    # Collect recipe details for the meal plan
+    # Collect recipe details for the meal plan (duplicates removed, order kept)
     meal_plan_recipes: list[dict[str, str]] = []
-    for recipe_id in recipe_ids:
+    skipped: list[str] = []
+    for recipe_id in dict.fromkeys(r.strip() for r in recipe_ids):
         recipe_details = get_recipe_details(recipe_id)
         if recipe_details.startswith(
             ("No saved information", "Error", "Recipes directory")
         ):
+            skipped.append(recipe_id)
             continue
         recipe_data: JSONDict = json.loads(recipe_details)
         meal_plan_recipes.append(
@@ -264,6 +280,15 @@ def create_meal_plan(recipe_ids: list[str], plan_name: str = "My Meal Plan") -> 
                 "cuisine": recipe_data.get("cuisine", "Unknown"),
                 "category": recipe_data.get("category", "Unknown"),
             }
+        )
+
+    skipped_note = (
+        f" Skipped unknown recipe IDs: {', '.join(skipped)}." if skipped else ""
+    )
+    if not meal_plan_recipes:
+        return (
+            "Meal plan not created: none of the recipe IDs are saved. "
+            "Search for recipes first, then use the returned IDs." + skipped_note
         )
 
     meal_plan: JSONDict = {
@@ -277,15 +302,19 @@ def create_meal_plan(recipe_ids: list[str], plan_name: str = "My Meal Plan") -> 
         meal_plans_dir = RECIPES_DIR / "meal_plans"
         meal_plans_dir.mkdir(mode=0o755, exist_ok=True)
         plan_file = meal_plans_dir / f"{_sanitize_name(plan_name, 'meal_plan')}.json"
+        action = "updated" if plan_file.exists() else "created"
         _save_json(plan_file, meal_plan)
     except OSError as e:
         return f"Error creating meal plan: {e}"
 
-    return f"Meal plan '{plan_name}' created successfully with {len(meal_plan_recipes)} recipes. Saved to: {plan_file}"
+    return (
+        f"Meal plan '{plan_name}' {action} successfully with {len(meal_plan_recipes)} recipes. "
+        f"Saved to: {plan_file}.{skipped_note}"
+    )
 
 
 @mcp.tool()
-def search_by_first_letter(letter: str, max_results: int = 5) -> list[str]:
+def search_by_first_letter(letter: str, max_results: MaxResults = 5) -> list[str]:
     """
     Search for recipes that start with a specific letter. Extract ONLY the single letter from user query.
 
@@ -301,19 +330,18 @@ def search_by_first_letter(letter: str, max_results: int = 5) -> list[str]:
     Returns:
         List of recipe IDs found in the search
     """
-    if len(letter) != 1 or not letter.isalpha():
+    letter = letter.strip()
+    if len(letter) != 1 or not (letter.isascii() and letter.isalpha()):
         return ["Please provide a single letter (a-z)"]
 
     try:
-        meals = _fetch_meals(f"search.php?f={letter.lower()}")[:max_results]
+        meals = _fetch_meals("search.php", f=letter.lower())[:max_results]
         if not meals:
             return [f"No recipes found starting with letter: {letter}"]
 
-        recipe_ids: list[str] = [meal["idMeal"] for meal in meals]
-
-        # Save a simple summary file to the letters directory
+        # Save full details (for get_recipe_details) plus a summary file
         letters_dir = RECIPES_DIR / "by_letter"
-        letters_dir.mkdir(mode=0o755, exist_ok=True)
+        recipe_ids = _save_recipes(letters_dir, meals)
         summary: JSONDict = {
             "letter": letter.upper(),
             "found_recipes": len(recipe_ids),
@@ -343,6 +371,8 @@ def get_random_recipe() -> str:
             return "No random recipe found"
         meal = meals[0]
         recipe_info: JSONDict = {"id": meal.get("idMeal"), **_parse_meal(meal)}
+        # Save it so get_recipe_details / create_meal_plan can use this ID
+        _save_recipes(RECIPES_DIR / "random", [meal])
     except requests.RequestException as e:
         return f"Error getting random recipe: {e}"
     except DATA_ERRORS as e:
@@ -422,9 +452,15 @@ def get_cuisine_recipes(cuisine: str) -> str:
     Args:
         cuisine: The cuisine/dish folder name to retrieve recipes for
     """
-    recipes_file = RECIPES_DIR / cuisine / "recipes_info.json"
+    collection = RECIPES_DIR / cuisine
+    recipes_file = collection / RECIPES_FILE
 
-    if not recipes_file.exists():
+    # Only real collections: no path tricks, no meal_plans/lookup folders
+    is_collection = (
+        collection.resolve().parent == RECIPES_DIR.resolve()
+        and cuisine not in NON_COLLECTION_DIRS
+    )
+    if not is_collection or not recipes_file.exists():
         return f"# No recipes found for: {cuisine}\n\nTry searching for recipes on this topic first."
 
     try:
