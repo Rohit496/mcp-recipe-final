@@ -1,0 +1,20 @@
+[project]
+name = "mcp-course"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Rohit Kumar", email = "rohitdotnet@outlook.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "mcp[cli]>=2.3,<3",
+    "requests>=2.34.2",
+]
+
+[project.scripts]
+mcp-course = "mcp_course:main"
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"

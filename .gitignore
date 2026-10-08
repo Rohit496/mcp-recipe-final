@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets
+.env
+.env.*
+
+# Editor / tool / OS local state
+.vscode/
+.playwright-mcp/
+.sf/
+.sfdx/
+.DS_Store
+
+# Data generated at runtime by recipe_server.py
+src/mcp_course/recipes/
